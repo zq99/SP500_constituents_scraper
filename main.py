@@ -1,96 +1,236 @@
+
+"""
+S&P 500 Constituents Scraper
+
+Downloads the current S&P 500 constituents table from Wikipedia
+and saves it as sp500list.csv in the same directory as this script.
+
+Dependencies:
+    pip install requests beautifulsoup4 pandas
+"""
+
 import logging
 import os
+import tempfile
+from pathlib import Path
+
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
-
-url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-
-log = logging.getLogger("sp500")
-logging.basicConfig(level=logging.INFO)
 
 
-def get_sp500ListFromWikipedia():
-    """
-    Scrapes the wikipedia page for the list of constituents
-    :Returns: a dataframe
-    """
-    data = requests.get(url).text
-    soup = BeautifulSoup(data, 'html.parser')
-    table = soup.find_all('table', {'id': 'constituents'})
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 
-    table_body = table[0].find_all('tbody')
+SCRIPT_DIR = Path(__file__).resolve().parent
+OUTPUT_FILE = SCRIPT_DIR / "sp500list.csv"
 
-    rows = table_body[0].find_all('tr')
-    data = []
-    headers = ['symbol', 'security', 'sec_filings', 'gics_sector', 'sub_industry', 'headquarters', 'date_added', 'cik',
-               'founded']
-    for tr in rows:
-        cols = tr.findAll('td')
-        row = []
-        if cols:
-            for a in cols:
-                row.append(a.text.strip())
-        if row:
-            data.append(row)
-    df = pd.DataFrame(data, columns=headers)
+WIKIPEDIA_URL = (
+    "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+)
+
+USER_AGENT = (
+    "SP500ConstituentsScraper/1.0 "
+    "(https://github.com/zq99/SP500_constituents_scraper)"
+)
+
+REQUEST_TIMEOUT = 30
+
+COLUMNS = [
+    "symbol",
+    "security",
+    "gics_sector",
+    "sub_industry",
+    "headquarters",
+    "date_added",
+    "cik",
+    "founded",
+]
+
+logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------
+# Download
+# ------------------------------------------------------------
+
+def fetch_wikipedia_html() -> str:
+    """Download the Wikipedia page containing S&P 500 constituents."""
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html",
+    }
+
+    logger.info("Fetching S&P 500 constituents from Wikipedia...")
+
+    response = requests.get(
+        WIKIPEDIA_URL,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    return response.text
+
+
+# ------------------------------------------------------------
+# Parse
+# ------------------------------------------------------------
+
+def parse_constituents(html: str) -> pd.DataFrame:
+    """Extract the S&P 500 constituents table into a DataFrame."""
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    table = soup.find("table", id="constituents")
+
+    if table is None:
+        raise ValueError(
+            "S&P 500 constituents table not found. "
+            "Wikipedia may have changed its page structure "
+            "or rejected the request."
+        )
+
+    records = []
+
+    for tr in table.find_all("tr"):
+
+        cells = tr.find_all("td", recursive=False)
+
+        # Skip header rows.
+        if not cells:
+            continue
+
+        if len(cells) != len(COLUMNS):
+            raise ValueError(
+                "Unexpected Wikipedia table structure. "
+                f"Expected {len(COLUMNS)} columns, "
+                f"found {len(cells)}."
+            )
+
+        record = [
+            cell.get_text(" ", strip=True)
+            for cell in cells
+        ]
+
+        records.append(record)
+
+    if not records:
+        raise ValueError(
+            "No S&P 500 constituent records were extracted."
+        )
+
+    df = pd.DataFrame(
+        records,
+        columns=COLUMNS,
+        dtype=str,
+    )
+
+    # Preserve identifiers, including leading zeros in CIK.
+    df["cik"] = df["cik"].str.strip()
+
+    # Basic validation.
+    if df["symbol"].eq("").any():
+        raise ValueError("One or more constituent symbols are empty.")
+
+    if df["symbol"].duplicated().any():
+        duplicates = df.loc[
+            df["symbol"].duplicated(), "symbol"
+        ].tolist()
+
+        raise ValueError(
+            f"Duplicate constituent symbols detected: {duplicates}"
+        )
+
+    logger.info("Extracted %d constituents.", len(df))
+
     return df
 
 
-def get_size(filename):
+# ------------------------------------------------------------
+# Save
+# ------------------------------------------------------------
+
+def save_csv(df: pd.DataFrame) -> None:
     """
-    size of the file created
-    :return: 0 if nothing else file
+    Save the CSV alongside this script.
+
+    Uses a temporary file to avoid corrupting an existing
+    CSV if the write operation fails.
     """
-    if os.path.isfile(filename):
-        if os.path.isfile(filename):
-            st = os.stat(filename)
-            return st.st_size
-    return 0
 
+    temporary_path = None
 
-def is_valid_file(file_name):
-    return os.path.isfile(file_name) and get_size(file_name) > 0
-
-
-def export_df(data_df, file_name, index_required=True):
     try:
-        data_df.to_csv(file_name, index=index_required, encoding='utf-8-sig')
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8-sig",
+            newline="",
+            suffix=".csv",
+            prefix=".sp500_",
+            dir=SCRIPT_DIR,
+            delete=False,
+        ) as temporary_file:
+
+            temporary_path = Path(temporary_file.name)
+
+            df.to_csv(
+                temporary_file,
+                index=False,
+            )
+
+        # Replace the existing CSV only after a successful write.
+        os.replace(temporary_path, OUTPUT_FILE)
+
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+    logger.info(
+        "Saved %d constituents to: %s",
+        len(df),
+        OUTPUT_FILE,
+    )
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
+def create_sp500_file() -> bool:
+    """Download, validate and save the S&P 500 constituent list."""
+
+    try:
+        html = fetch_wikipedia_html()
+
+        df = parse_constituents(html)
+
+        save_csv(df)
+
         return True
-    except PermissionError:
-        log.error("unable to access existing file {}".format(file_name))
-        return False
-    except Exception as e:
-        log.error(e)
-        return False
+
+    except requests.RequestException as exc:
+        logger.error("Wikipedia download failed: %s", exc)
+
+    except ValueError as exc:
+        logger.error("Data validation failed: %s", exc)
+
+    except OSError as exc:
+        logger.error("Unable to save CSV: %s", exc)
+
+    return False
 
 
-def get_file_name(file_name, timestamp=True, file_ext='.csv'):
-    full_file = file_name + "_" + get_date_stamp() + file_ext if timestamp else file_name + file_ext
-    return full_file
+if __name__ == "__main__":
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
 
-def get_date_stamp():
-    return datetime.today().strftime('%Y%m%d')
+    success = create_sp500_file()
 
-
-def create_sp500_file():
-    """
-    Main process to extact the data
-    :return: True or False if created
-    """
-    df = get_sp500ListFromWikipedia()
-    file = get_file_name('sp500list', False)
-    export_df(df, file, False)
-    is_valid = is_valid_file(file)
-    if not is_valid:
-        log.error("file [{}] does NOT exist!".format(file))
-        return False
-    else:
-        log.info("file [{}] has been created!".format(file))
-        return True
-
-
-if __name__ == '__main__':
-    create_sp500_file()
+    raise SystemExit(0 if success else 1)
